@@ -1,24 +1,36 @@
-import shutil
-import kagglehub
+from __future__ import annotations
+
+import os
 from pathlib import Path
+import kagglehub
 
-def main():
-    path = kagglehub.dataset_download(
-        "ahmeduzaki/global-earthquake-tsunami-risk-assessment-dataset"
-    )
-    print("Path to dataset files:", path)
 
-    DATA_DIR = Path.home() / ".cache/kagglehub/datasets/ahmeduzaki/global-earthquake-tsunami-risk-assessment-dataset/versions/1"
+DATASET = "ahmeduzaki/global-earthquake-tsunami-risk-assessment-dataset"
+TARGET_FILENAME = "earthquake_data_tsunami.csv"
 
-    BASE_DIR = Path(__file__).resolve().parents[1]
-    RAW_DIR = BASE_DIR / "data" / "raw"
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    src = DATA_DIR / "earthquake_data_tsunami.csv"
-    dst = RAW_DIR / "earthquake_data_tsunami.csv"
+def main() -> None:
+    raw_dir = Path("data/raw")
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-    shutil.copy(src, dst)
-    print("Saved raw file to:", dst)
+    path = kagglehub.dataset_download(DATASET)
+    path = Path(path)
+
+    # Find the CSV inside the downloaded folder
+    csv_candidates = list(path.rglob(TARGET_FILENAME))
+    if not csv_candidates:
+        # fallback: any csv
+        csv_candidates = list(path.rglob("*.csv"))
+
+    if not csv_candidates:
+        raise FileNotFoundError(f"No CSV found in downloaded dataset folder: {path}")
+
+    src = csv_candidates[0]
+    dst = raw_dir / TARGET_FILENAME
+    dst.write_bytes(src.read_bytes())
+
+    print("Downloaded dataset to:", dst)
+
 
 if __name__ == "__main__":
     main()
