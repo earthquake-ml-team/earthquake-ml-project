@@ -1,50 +1,46 @@
-import pandas as pd
+from __future__ import annotations
+
 from pathlib import Path
+import pandas as pd
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-PROCESSED_DIR = BASE_DIR / "data" / "processed"
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-def main():
-    src = PROCESSED_DIR / "earthquakes_with_cells.csv"
-    dst = PROCESSED_DIR / "ml_cell_month_dataset.csv"
+IN_FILE = Path("data/processed/earthquakes_gridded.csv")
+OUT_FILE = Path("data/processed/labels.csv")
 
-    df = pd.read_csv(src, parse_dates=["month_date"])
 
-    # Max magnitude per cell per month
-    monthly = (
-        df.groupby(["cell_id", "month_date"])["magnitude"]
-        .max()
-        .reset_index()
-        .sort_values(["cell_id", "month_date"])
-    )
+def assign_class(mag: float, threshold: float) -> int:
+    if pd.isna(mag) or mag < threshold:
+        return -1
+    if threshold <= mag <= 6.9:
+        return 0
+    if 7.0 <= mag <= 7.9:
+        return 1
+    return 2
 
-    # Next month target
+
+def main(threshold: float = 7.0) -> None:
+    if not IN_FILE.exists():
+        raise FileNotFoundError(f"Missing {IN_FILE}. Run 02_make_grid.py first.")
+
+    df = pd.read_csv(IN_FILE, parse_dates=["month_date"])
+    df["Year"] = df["month_date"].dt.year
+    df["Month"] = df["month_date"].dt.month
+
+    monthly = df.groupby(["cell_id", "Year", "Month"])["magnitude"].max().reset_index()
+    monthly = monthly.sort_values(["cell_id", "Year", "Month"])
+
     monthly["next_month_max_mag"] = monthly.groupby("cell_id")["magnitude"].shift(-1)
-
-    # y_prob (binary)
-    threshold = 6.0
     monthly["y_prob"] = (monthly["next_month_max_mag"] >= threshold).astype(int)
+    monthly["y_class"] = monthly["next_month_max_mag"].apply(lambda m: assign_class(m, threshold))
 
-    # y_class (multi-class)
-    def assign_class(mag):
-        if pd.isna(mag) or mag < threshold:
-            return -1
-        elif 6.0 <= mag <= 6.9:
-            return 0
-        elif 7.0 <= mag <= 7.9:
-            return 1
-        else:
-            return 2
+    labels = monthly.dropna(subset=["next_month_max_mag"]).copy()
 
-    monthly["y_class"] = monthly["next_month_max_mag"].apply(assign_class)
+    labels["month_date"] = pd.to_datetime(dict(year=labels["Year"], month=labels["Month"], day=1))
+    labels = labels[["cell_id", "month_date", "y_prob", "y_class", "next_month_max_mag"]]
 
-    # Drop rows where next month doesn't exist
-    final_labels = monthly.dropna(subset=["next_month_max_mag"]).copy()
+    labels.to_csv(OUT_FILE, index=False)
+    print("Saved:", OUT_FILE, "| rows:", len(labels), "| threshold:", threshold)
 
-    final_labels.to_csv(dst, index=False)
-    print("Saved:", dst)
-    print(f"Rows: {len(final_labels)}, Cols: {len(final_labels.columns)}")
 
 if __name__ == "__main__":
     main()

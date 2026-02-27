@@ -1,81 +1,122 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
-import streamlit as st
-import plotly.express as px
+import requests
+from flask import Flask, jsonify, send_from_directory
 
-st.set_page_config(page_title="Earthquake Risk Predictor", layout="wide")
+# Pipeline prediction script output
+PRED_FILE = Path("outputs/predictions_latest_month.csv")
 
-st.title("Earthquake Risk & Depth Visualizer + Predictor")
-st.write("Shows grid-cell risk predictions for the latest month from the ML pipeline.")
+# UI directory
+UI_DIR = Path("ui")
 
-PRED_PATH = "outputs/predictions_latest_month.csv"
+app = Flask(__name__, static_folder=None)
 
-@st.cache_data
-def load_preds(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
 
-    # If your file doesn't have lat/lon yet, we can derive from cell_id (common format: "lat_lon")
-    if "cell_id" in df.columns and ("grid_lat" not in df.columns or "grid_lon" not in df.columns):
-        parts = df["cell_id"].astype(str).str.split("_", expand=True)
-        if parts.shape[1] >= 2:
-            df["grid_lat"] = pd.to_numeric(parts[0], errors="coerce")
-            df["grid_lon"] = pd.to_numeric(parts[1], errors="coerce")
+def ensure_predictions() -> None:
+    """
+    If predictions file doesn't exist, attempt to generate it by running pipeline step 08.
+    """
+    if PRED_FILE.exists():
+        return
 
-    return df
+    # Minimal: run step 08 only (assumes models exist)
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "pipeline/08_predict_latest_month.py"])
 
-try:
-    preds = load_preds(PRED_PATH)
-except FileNotFoundError:
-    st.error(f"Could not find {PRED_PATH}. Run your pipeline first to generate predictions.")
-    st.stop()
 
-# Sidebar controls
-st.sidebar.header("Controls")
-if "risk_prob" in preds.columns:
-    thresh = st.sidebar.slider("Risk threshold", 0.0, 1.0, 0.5, 0.01)
-else:
-    thresh = st.sidebar.slider("Risk threshold (risk_prob column missing)", 0.0, 1.0, 0.5, 0.01)
+@app.get("/api/predictions/latest")
+def api_predictions_latest():
+    ensure_predictions()
+    df = pd.read_csv(PRED_FILE)
+    # return as JSON records
+    return jsonify(df.to_dict(orient="records"))
 
-# Filter high risk
-if "risk_prob" in preds.columns:
-    high = preds[preds["risk_prob"] >= thresh].copy()
-else:
-    high = preds.copy()
 
-# Alerts
-st.subheader("Alerts")
-if len(high) == 0:
-    st.info("No cells above the current threshold.")
-else:
-    # Show a few alerts
-    show_n = min(10, len(high))
-    for _, row in high.sort_values("risk_prob", ascending=False).head(show_n).iterrows():
-        cell = row.get("cell_id", "unknown_cell")
-        prob = row.get("risk_prob", None)
-        mag_class = row.get("predicted_class", row.get("y_class_pred", ""))
-        if prob is not None:
-            st.write(f"• High risk ({prob:.2f}) in cell {cell}, predicted class: {mag_class}")
-        else:
-            st.write(f"• High risk in cell {cell}, predicted class: {mag_class}")
+@app.get("/api/live")
+def api_live_quakes():
+    """
+    Live earthquakes from USGS for the last 48 hours (min magnitude 4.0).
+    If it fails, return a small fallback list so UI still shows points.
+    """
+    from datetime import datetime, timedelta, timezone
 
-# Map
-st.subheader("Map")
-needed = {"grid_lat", "grid_lon"}
-if needed.issubset(preds.columns) and "risk_prob" in preds.columns:
-    fig = px.scatter_geo(
-        preds,
-        lat="grid_lat",
-        lon="grid_lon",
-        size="risk_prob",
-        hover_name="cell_id" if "cell_id" in preds.columns else None,
-        hover_data=["risk_prob"] + (["predicted_class"] if "predicted_class" in preds.columns else []),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.warning("Map requires columns grid_lat, grid_lon, and risk_prob. If your predictions file lacks them, we can add them in pipeline/08.")
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=48)
 
-# Table view
-st.subheader("Top Risky Cells")
-if "risk_prob" in preds.columns:
-    st.dataframe(preds.sort_values("risk_prob", ascending=False).head(10))
-else:
-    st.dataframe(preds.head(10))
+    url = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+    params = {
+        "format": "geojson",
+        "starttime": start.strftime("%Y-%m-%dT%H:%M:%S"),
+        "endtime": end.strftime("%Y-%m-%dT%H:%M:%S"),
+        "minmagnitude": 4.0,
+        "orderby": "time",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        out = []
+        for f in data.get("features", []):
+            prop = f.get("properties", {})
+            geom = f.get("geometry", {})
+            coords = geom.get("coordinates", [])
+            if len(coords) < 2:
+                continue
+
+            lon, lat = coords[0], coords[1]
+            mag = prop.get("mag")
+            t_ms = prop.get("time")
+
+            t_str = ""
+            if t_ms:
+                t_str = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+            out.append({
+                "lat": float(lat),
+                "lon": float(lon),
+                "mag": float(mag) if mag is not None else None,
+                "time": t_str,
+                "type": "Live Quake (USGS 48h)"
+            })
+
+        # If USGS returns nothing (rare), still return empty (real data)
+        return jsonify(out)
+
+    except Exception as e:
+        # IMPORTANT: print error so you can see it in terminal
+        print("USGS live quake fetch failed:", repr(e))
+
+        # ✅ fallback like your teammate so you always see live points
+        fallback = [
+            {"lat": 35.6895, "lon": 139.6917, "mag": 4.5, "time": "Fallback", "type": "Live Quake"},
+            {"lat": -12.0464, "lon": -77.0428, "mag": 5.2, "time": "Fallback", "type": "Live Quake"},
+        ]
+        return jsonify(fallback)
+
+# ---- Static UI ----
+@app.get("/")
+def index():
+    return send_from_directory(UI_DIR, "earthquake_dashboard.html")
+
+
+@app.get("/styles.css")
+def styles():
+    return send_from_directory(UI_DIR, "styles.css")
+
+
+@app.get("/main.js")
+def js():
+    return send_from_directory(UI_DIR, "main.js")
+
+
+if __name__ == "__main__":
+    UI_DIR.mkdir(exist_ok=True)
+    app.run(host="127.0.0.1", port=8000, debug=True)
